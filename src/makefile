@@ -1,20 +1,20 @@
 LDLIBS=-lpcap
 
-all: send-arp-test
+TARGET=arp-spoof
 
+all: $(TARGET)
 
-main.o: mac.h ip.h ethhdr.h arphdr.h main.cpp
+main.o: main.cpp ethhdr.h arphdr.h ip.h mac.h
+	$(CXX) $(CXXFLAGS) -c -o $@ main.cpp
 
-arphdr.o: mac.h ip.h arphdr.h arphdr.cpp
+ip.o: ip.cpp ip.h
+	$(CXX) $(CXXFLAGS) -c -o $@ ip.cpp
 
-ethhdr.o: mac.h ethhdr.h ethhdr.cpp
+mac.o: mac.cpp mac.h
+	$(CXX) $(CXXFLAGS) -c -o $@ mac.cpp
 
-ip.o: ip.h ip.cpp
-
-mac.o : mac.h mac.cpp
-
-send-arp-test: main.o arphdr.o ethhdr.o ip.o mac.o
+$(TARGET): main.o ip.o mac.o
 	$(LINK.cc) $^ $(LOADLIBES) $(LDLIBS) -o $@
 
 clean:
-	rm -f send-arp-test *.o
+	rm -f $(TARGET) *.o
